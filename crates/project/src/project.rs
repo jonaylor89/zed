@@ -1,5 +1,6 @@
 pub mod agent_registry_store;
 pub mod agent_server_store;
+pub mod audio_store;
 pub mod buffer_store;
 pub mod color_extractor;
 pub mod connection_manager;
@@ -73,6 +74,8 @@ use debugger::{
 
 pub use environment::ProjectEnvironment;
 
+pub use audio_store::{AudioItem, AudioStore};
+use audio_store::{AudioItemEvent, AudioStoreEvent};
 use futures::{
     StreamExt,
     channel::mpsc::{self, UnboundedReceiver},
@@ -226,6 +229,7 @@ pub struct Project {
     buffer_store: Entity<BufferStore>,
     context_server_store: Entity<ContextServerStore>,
     image_store: Entity<ImageStore>,
+    audio_store: Entity<AudioStore>,
     lsp_store: Entity<LspStore>,
     _subscriptions: Vec<gpui::Subscription>,
     buffers_needing_diff: HashSet<WeakEntity<Buffer>>,
@@ -1216,6 +1220,10 @@ impl Project {
             cx.subscribe(&image_store, Self::on_image_store_event)
                 .detach();
 
+            let audio_store = cx.new(|cx| AudioStore::local(worktree_store.clone(), cx));
+            cx.subscribe(&audio_store, Self::on_audio_store_event)
+                .detach();
+
             let prettier_store = cx.new(|cx| {
                 PrettierStore::new(
                     node.clone(),
@@ -1295,6 +1303,7 @@ impl Project {
                 worktree_store,
                 buffer_store,
                 image_store,
+                audio_store,
                 lsp_store,
                 context_server_store,
                 join_project_response_message_id: 0,
@@ -1394,6 +1403,14 @@ impl Project {
             });
             let image_store = cx.new(|cx| {
                 ImageStore::remote(
+                    worktree_store.clone(),
+                    remote.read(cx).proto_client(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    cx,
+                )
+            });
+            let audio_store = cx.new(|cx| {
+                AudioStore::remote(
                     worktree_store.clone(),
                     remote.read(cx).proto_client(),
                     REMOTE_SERVER_PROJECT_ID,
@@ -1510,6 +1527,7 @@ impl Project {
                 worktree_store,
                 buffer_store,
                 image_store,
+                audio_store,
                 lsp_store,
                 context_server_store,
                 breakpoint_store,
@@ -1686,6 +1704,9 @@ impl Project {
         let image_store = cx.new(|cx| {
             ImageStore::remote(worktree_store.clone(), client.clone().into(), remote_id, cx)
         });
+        let audio_store = cx.new(|cx| {
+            AudioStore::remote(worktree_store.clone(), client.clone().into(), remote_id, cx)
+        });
 
         let environment =
             cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx));
@@ -1799,6 +1820,7 @@ impl Project {
                 buffer_ordered_messages_tx: tx,
                 buffer_store: buffer_store.clone(),
                 image_store,
+                audio_store,
                 worktree_store: worktree_store.clone(),
                 lsp_store: lsp_store.clone(),
                 context_server_store,
@@ -3175,6 +3197,49 @@ impl Project {
         })
     }
 
+    pub fn open_audio(
+        &mut self,
+        path: impl Into<ProjectPath>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AudioItem>>> {
+        if self.is_disconnected(cx) {
+            return Task::ready(Err(anyhow!(ErrorCode::Disconnected)));
+        }
+
+        let open_audio_task = self.audio_store.update(cx, |audio_store, cx| {
+            audio_store.open_audio(path.into(), cx)
+        });
+
+        let weak_project = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let audio_item = open_audio_task.await?;
+
+            let needs_metadata =
+                cx.read_entity(&audio_item, |item, _| item.audio_metadata.is_none());
+
+            if needs_metadata {
+                let project = weak_project.upgrade().context("Project dropped")?;
+                let metadata =
+                    AudioItem::load_audio_metadata(audio_item.clone(), project, cx).await?;
+                audio_item.update(cx, |audio_item, cx| {
+                    audio_item.audio_metadata = Some(metadata);
+                    cx.emit(AudioItemEvent::MetadataUpdated);
+                });
+            }
+
+            Ok(audio_item)
+        })
+    }
+
+    pub fn reload_audios(
+        &self,
+        audios: HashSet<Entity<AudioItem>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.audio_store
+            .update(cx, |audio_store, cx| audio_store.reload_audios(audios, cx))
+    }
+
     async fn send_buffer_ordered_messages(
         project: WeakEntity<Self>,
         rx: UnboundedReceiver<BufferOrderedMessage>,
@@ -3323,6 +3388,22 @@ impl Project {
             ImageStoreEvent::ImageAdded(image) => {
                 cx.subscribe(image, |this, image, event, cx| {
                     this.on_image_event(image, event, cx);
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn on_audio_store_event(
+        &mut self,
+        _: Entity<AudioStore>,
+        event: &AudioStoreEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            AudioStoreEvent::AudioAdded(audio) => {
+                cx.subscribe(audio, |this, audio, event, cx| {
+                    this.on_audio_event(audio, event, cx);
                 })
                 .detach();
             }
@@ -3688,6 +3769,22 @@ impl Project {
             && !self.is_via_collab()
         {
             self.reload_images([image].into_iter().collect(), cx)
+                .detach_and_log_err(cx);
+        }
+
+        None
+    }
+
+    fn on_audio_event(
+        &mut self,
+        audio: Entity<AudioItem>,
+        event: &AudioItemEvent,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        if let AudioItemEvent::ReloadNeeded = event
+            && !self.is_via_collab()
+        {
+            self.reload_audios([audio].into_iter().collect(), cx)
                 .detach_and_log_err(cx);
         }
 
