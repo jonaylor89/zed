@@ -4795,6 +4795,7 @@ mod tests {
                 "app_menu",
                 "assistant",
                 "assistant2",
+                "audio_viewer",
                 "auto_update",
                 "branch_picker",
                 "bedrock",
